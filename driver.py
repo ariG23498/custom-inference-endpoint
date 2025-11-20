@@ -1,6 +1,4 @@
 import os
-
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 from transformers import Mistral3ForConditionalGeneration, AutoProcessor
 import torch
 from text_encoding import encode_prompt
