@@ -145,11 +145,17 @@ def root():
 
 @app.get("/health")
 def health():
-    """Simple health endpoint."""
+    model_loaded = (
+        model_manager.text_encoder is not None and
+        model_manager.tokenizer is not None
+    )
+
+    if not model_loaded:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
     return {
         "status": "healthy",
-        "model_loaded": model_manager.text_encoder is not None
-        and model_manager.tokenizer is not None,
+        "model_loaded": True,
         "device_map": model_manager.device_map,
         "dtype": str(model_manager.dtype),
     }
