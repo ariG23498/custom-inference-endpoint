@@ -3,21 +3,22 @@ import io
 import time
 from transformers import Mistral3ForConditionalGeneration, AutoProcessor
 import torch
-from text_encoding import encode_prompt
+from mistral_text_encoding_core import encode_prompt
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
+
 
 def post_with_retries(
     url: str,
     json: dict,
     headers: dict,
     max_retries: int = 20,
-    initial_delay: float = 5.0,      # seconds
-    backoff_factor: float = 1.5,     # gentler growth
+    initial_delay: float = 5.0,  # seconds
+    backoff_factor: float = 1.5,  # gentler growth
     max_wait_minutes: float = 10.0,  # total wall-clock budget
-    timeout: float = 60.0,           # per-request timeout
+    timeout: float = 60.0,  # per-request timeout
 ) -> requests.Response:
     """
     POST with retry logic:
@@ -48,7 +49,9 @@ def post_with_retries(
                     f"Exceeded max_wait_minutes={max_wait_minutes} after request error."
                 )
             sleep_for = min(delay, remaining)
-            print(f"[attempt {attempt}] request error: {e}, retrying in {sleep_for:.1f}s...")
+            print(
+                f"[attempt {attempt}] request error: {e}, retrying in {sleep_for:.1f}s..."
+            )
             time.sleep(sleep_for)
             delay *= backoff_factor
             continue
@@ -104,7 +107,7 @@ if __name__ == "__main__":
         url=url,
         json=payload,
         headers=headers,
-        max_wait_minutes=10.0,   # tweak this: e.g. 5, 10, 15...
+        max_wait_minutes=10.0,  # tweak this: e.g. 5, 10, 15...
         initial_delay=5.0,
         backoff_factor=2,
     )

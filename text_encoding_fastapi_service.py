@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from transformers import Mistral3ForConditionalGeneration, AutoProcessor
 
-from text_encoding import encode_prompt
+from mistral_text_encoding_core import encode_prompt
 
 # ------------------------------------------------------
 # Logging

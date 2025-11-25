@@ -1,177 +1,134 @@
-# Deploying a Custom Deep Learning Service (FastAPI + Docker + 🤗 Inference Endpoints)
+# 🚀 Deploying Custom Mistral Text Encodings with FastAPI, Docker, and 🤗 Inference Endpoints
 
-Deploying a Large Language Model (LLM) is easy with [Inference Endpoints](https://huggingface.co/docs/inference-endpoints/main/en/index), but exposing **custom logic** (custom hidden-state extraction, custom embeddings, custom metadata) is where things get interesting.
+Most model deployments expose *generation*. But production systems often need something else: **custom model internals** — hidden states, stacked embeddings, layer-specific representations, or custom token coordinate IDs.
 
-This post walks through **building, testing, containerizing, and deploying** a custom text-encoding service using:
+This post walks through a minimal, reproducible pipeline to:
 
-* [**Mistral-3-Small**](hf.co/mistralai/Mistral-Small-3.2-24B-Instruct-2506) for encoding
-* **FastAPI** for serving
-* **Docker** for packaging
-* **🤗 Inference Endpoints** for production
+1. Build a **custom text-encoding function** using Mistral-3-Small
+2. Serve it with **FastAPI**
+3. Package it as a **Docker container**
+4. Deploy it on **🤗 Inference Endpoints**
+5. Verify **local vs. remote determinism**
 
-The goal: provide a REST endpoint that returns **custom prompt embeddings** and a **custom 4-dim text-ID tensor**, computed exactly the way *you* 🫵🏻 want.
+This gives you a **production-grade** REST endpoint that returns *your* exact embeddings.
 
-## 1. 🧩 Why Custom LLM Functions Matter
+## 1. Core Idea: Keep Custom Logic Isolated
 
-LLM deployments typically expose generation or chat APIs. But real production systems often require **intermediate model artifacts**:
-
-* specific hidden layers
-* concatenated embeddings
-* custom coordinate encodings
-* pre-processing rules
-* application-defined text IDs
-
-The [`text_encoding.py`](./text_encoding.py) implements exactly this. It extract hidden states from layers `(10, 20, 30)`, stacks/reshapes them, and attachs custom `text_ids`.
-
-You can test drive the custom function using the following snippet:
-```py
-from text_encoding import encode_prompt
-from transformers import Mistral3ForConditionalGeneration, AutoProcessor
-
-text_enc_id = "mistralai/Mistral-Small-3.2-24B-Instruct-2506"
-text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
-    text_enc_id, dtype=torch.bfloat16, device_map="cuda"
-).eval()
-
-tok_id = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
-tokenizer = AutoProcessor.from_pretrained(tok_id)
-
-prompt = ["hello aritra", "how are you?"]
-prompt_embeds, text_ids = encode_prompt(
-    text_encoder=text_encoder,
-    tokenizer=tokenizer,
-    prompt=prompt,
-)
-```
-
-Having all the logic contained inside of a file (like `text_encoding.py`) gives us the access to test the custom function in isolation.
-
-## 2. ⚙️ Building the FastAPI Application
-
-Now we expose this as an API, by wrapping the custom function `encode_prompt` inside a FastAPI service.
-
-### Key Points
-
-* The model and tokenizer load **once**, inside `FastAPI`’s **lifespan** context.
-* Gradients are disabled globally.
-* `/predict` returns JSON-compatible tensors.
-* Incoming prompts may be a string or list of strings.
-
-### Main Server: [`api.py`](./api.py)
-
-The server:
-
-* Loads the Mistral encoder + processor at startup
-* Calls **`encode_prompt()`**, your custom embedding function
-* Detaches and moves tensors to CPU for JSON serialization
-* Returns shapes + timing
-* Runs on CUDA with `bfloat16` data type
-
-This gives the endpoint:
+All custom encoding logic, formatting prompts, extracting intermediate hidden states, reshaping embeddings, generating token IDs, lives in a single file:
 
 ```
-POST /predict
-{
-    "prompt": ["hello world"]
-}
+mistral_text_encoding_core.py
 ```
 
-Returns:
+This keeps experimentation clean:
 
-```
-{
-  "prompt_embeds": [...],
-  "text_ids": [...],
-  "shapes": { ... },
-  "time_ms": ...
-}
-```
+* You test the logic in isolation
+* You import it inside FastAPI without duplicating code
+* You can update the embedding logic without touching the API or Dockerfiles
 
-
-## 3. ⚡ FastAPI Startup Optimization
-
-To ensure the model loads exactly once and the resources are freed on shutdown we use:
-
-```python
-@asynccontextmanager
-async def lifespan(app):
-```
-
-The service is ready before the first request arrives
-
-## 4. 🧪 Local Testing with the Client
-
-The [`client.py`](./client.py) POSTs prompts to the local server and validates output equivalence. While theoratically it should always be the same, it is good practise to setup a testing suite even before serving the model. Having clarity of tought while working on deployments gives you an extra edge.
-
-Let's run the FastAPI server locally and then test for equivalence.
-```bash
-uvicorn api:app --host 0.0.0.0 --port 8000
-python client.py
-```
-
-You now have a **validated local API**.
-
-## 5. 🐳 Containerizing the Service
-
-The [`Dockerfile`](./Dockerfile):
-
-* Uses `pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime`
-* Installs `transformers`, `accelerate`, `fastapi`, `uvicorn`
-* Creates `/models` for HF cache
-* Copies your app code
-* Runs service as non-root user
-* Exposes port **7860**
-
-Build:
+To run it locally:
 
 ```bash
-docker build -t arig23498/mistral-endpoint .
+python local_encode_smoke_test.py
 ```
 
-Run locally:
+You should see a shape like:
+
+```
+Shape of prompt embeds = torch.Size([2, 512, 15360])
+```
+
+If this works, everything downstream will work.
+
+## 2. Serving the Encoder with FastAPI
+
+The service is built in:
+
+```
+text_encoding_fastapi_service.py
+```
+
+The FastAPI server:
+
+* Loads Mistral once at startup
+* Exposes a `/predict` endpoint
+* Runs the custom `encode_prompt()` from `mistral_text_encoding_core.py`
+* Serializes embeddings to bytes using `torch.save`
+* Returns them as `application/octet-stream`
+
+To start the API locally:
+
+> ![NOTE]
+> When you want to run the FastAPI service locally make sure to make the following change in the `text_encoding_fastapi_service.py`
+
+```diff
+- TEXT_ENCODER_ID = os.getenv("TEXT_ENCODER_ID", "/repository")
++ TEXT_ENCODER_ID = os.getenv("TEXT_ENCODER_ID", "mistralai/Mistral-Small-3.2-24B-Instruct-2506")
+```
 
 ```bash
-docker run --gpus all -p 7860:7860 arig23498/mistral-endpoint
+uvicorn text_encoding_fastapi_service:app --host 0.0.0.0 --port 8000
 ```
 
-Test:
+Test it with:
+
+```
+python fastapi_smoke_test.py
+```
+
+If shapes match your local smoke test, you are ready for deployment.
+
+## 3. Containerizing the Service
+
+The Dockerfile bundles:
+
+* PyTorch + CUDA (from the base image)
+* FastAPI + Uvicorn
+* Transformers + Accelerate
+* Your encoding logic and API
+
+Build the image:
 
 ```bash
-curl http://localhost:7860/
+docker build -t mistral-endpoint .
 ```
 
-## 6. 📦 Push Container to a Registry
-
-Tag the image:
+Run locally with GPU:
 
 ```bash
-docker tag arig23498/mistral-endpoint arig23498/mistral-endpoint:v1.0.0
+docker run --gpus all -p 7860:7860 mistral-endpoint
 ```
 
-Login:
+Check health:
 
 ```bash
-docker login
+curl http://localhost:7860/health
 ```
 
-Push:
+If the model loads and dtype/device look correct, we can proceed.
+
+## 4. Publishing the Container
+
+Push the image:
 
 ```bash
-docker push arig23498/mistral-endpoint:v1.0.0
+docker tag mistral-endpoint youruser/mistral-endpoint:v1
+docker push youruser/mistral-endpoint:v1
 ```
 
-Your custom container is now available for deployment.
-
+You now have a container accessible from Inference Endpoints.
 
 ## 7. ☁️ Deploy to Hugging Face Inference Endpoints
 
-The first step is to create an endpoint. Head over to [inference endpoints](https://endpoints.huggingface.co/) and click on the "+ New" button.
+The first step is to create an endpoint.
+Head over to [inference endpoints](https://endpoints.huggingface.co/) and click on the "+ New" button.
 
 | ![endpoint creation button](./assets/new-endpoint.png) |
 | :--: |
 | Click on the "new" button to create an endpoint |
 
-You will then have a pop up screen for the models to choose from. This is a no-op stage. We can choose anything we like, as this is not dependent on our final deployment. For this example I will choose the `mistralai/Mistral-Small-3.2-24B-Instruct-2506` model from the Hub.
+You will then have a pop up screen for the models to choose from. Choose the `mistralai/Mistral-Small-3.2-24B-Instruct-2506` model from the Hub. This will load the model to the `/repository`
+folder that we will use for model loading instead of downloading the model over internet (saving loading time and startup of the endpoint).
 
 | ![choose the model to deploy from](./assets/deploy-from.png) |
 | :--: |
@@ -183,13 +140,17 @@ We will now select the "Configure" button to go to the next step.
 | :--: |
 | Configure the deployment |
 
-You will be taken to the next page where you can select the Hardware (we select one A100), Authentication (we select public) and other configurations. Here we scroll down to the "Inference Engine" section and select "Custom".
+You will be taken to the next page where you can select the Hardware (we select one A100), Authentication (we select authenticated) and other configurations.
+Here we scroll down to the "Inference Engine" section and select "Custom".
 
 | ![custom inference engine](./assets/inference-engine.png) |
 | :--: |
 | Custom inference engine |
 
 As you can see, we fill the "Container URL" with our custom docker URL, and expose the container port.
+
+* **Container URL:** `docker.io/youruser/mistral-text-encoder:v1`
+* **Container Port:** `7860`
 
 After this you should be good to hit the "Create Endpoint" button. Once the deployment succeeds your remote URL becomes:
 
@@ -200,14 +161,77 @@ https://<endpoint-name>/predict
 Now you can replace local URL in [`driver.py`](./driver.py):
 
 ```python
-url = "<REMOTE_URL>/predict"
+url = "https://<name>.endpoints.huggingface.cloud/predict"
 ```
 
-And verify equivalence between **local embeddings** and **remote embeddings**:
+## 6. Verifying Local vs Remote Embeddings
 
-```python
-torch.testing.assert_close(local_prompt_embeds, remote_prompt_embeds)
-torch.testing.assert_close(local_text_ids, remote_text_ids)
+Use the verification script:
+
+```
+validate_inference_endpoint_equivalence.py
 ```
 
-This proves your endpoint is deterministic and production-ready.
+Create a `.env`:
+
+```
+HF_TOKEN=hf_your_token
+ENDPOINT=https://<name>.endpoints.huggingface.cloud
+```
+
+Run:
+
+```bash
+python validate_inference_endpoint_equivalence.py
+```
+
+Expected output:
+
+```
+✅ local and remote prompt_embeds match
+```
+
+This confirms deterministic behavior between:
+
+* your local PyTorch environment
+* your containerized FastAPI service
+* the running Inference Endpoint
+
+This end-to-end consistency is critical for downstream pipelines.
+
+# ✔️ Important Caveats
+
+These are subtle details that matter in real deployments:
+
+### 1. The model selected in the Endpoint UI *is not a no-op*
+
+* Inference Endpoints download that model into **`/repository`** *inside your container*
+* This makes `from_pretrained("/repository")` extremely fast
+* If you choose a different model in the UI → your embeddings will change
+* Keep UI selection & container code in sync
+
+### 2. Cold starts return **503**, not errors
+
+Inference Endpoints can sleep when idle.
+You will see:
+
+```
+503 Service Unavailable
+```
+
+until the container starts.
+
+The driver uses retry logic with exponential backoff — keep this.
+
+### 3. Authentication is required
+
+Calling the endpoint requires:
+
+```
+Authorization: Bearer <HF_TOKEN>
+```
+
+Even free Hugging Face accounts work, but:
+
+* Tokens must have `inference` scope
+* Private endpoints require proper token permissions

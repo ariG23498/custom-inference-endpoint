@@ -55,4 +55,4 @@ EXPOSE 7860
 # Command
 # -------------------------------------------------------------------
 # If your FastAPI file is `api.py` and app instance is `app`
-CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["uvicorn", "text_encoding_fastapi_service:app", "--host", "0.0.0.0", "--port", "7860"]
