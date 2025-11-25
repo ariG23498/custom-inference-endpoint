@@ -1,11 +1,13 @@
 import os
+import io
 import time
 import logging
-from typing import List, Union, Optional, Dict
+from typing import List, Union, Optional
 from contextlib import asynccontextmanager
 
 import torch
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from transformers import Mistral3ForConditionalGeneration, AutoProcessor
 
@@ -21,17 +23,9 @@ logging.basicConfig(
 logger = logging.getLogger("mistral-text-encoding-api")
 
 # ------------------------------------------------------
-# Global caches
-# ------------------------------------------------------
-text_encoder: Optional[Mistral3ForConditionalGeneration] = None
-tokenizer: Optional[AutoProcessor] = None
-
-# ------------------------------------------------------
 # Config
 # ------------------------------------------------------
-TEXT_ENCODER_ID = os.getenv(
-    "TEXT_ENCODER_ID", "mistralai/Mistral-Small-3.2-24B-Instruct-2506"
-)
+TEXT_ENCODER_ID = os.getenv("TEXT_ENCODER_ID", "/repository")
 TOKENIZER_ID = os.getenv(
     "TOKENIZER_ID", "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
 )
@@ -40,38 +34,88 @@ DTYPE = torch.bfloat16
 
 
 # ------------------------------------------------------
+# Model Manager
+# ------------------------------------------------------
+class ModelManager:
+    """Manages loading/unloading and access to the Mistral text encoder + tokenizer."""
+
+    def __init__(
+        self,
+        text_encoder_id: str = TEXT_ENCODER_ID,
+        tokenizer_id: str = TOKENIZER_ID,
+        device_map: str = DEVICE_MAP,
+        dtype: torch.dtype = DTYPE,
+    ):
+        self.text_encoder_id = text_encoder_id
+        self.tokenizer_id = tokenizer_id
+        self.device_map = device_map
+        self.dtype = dtype
+
+        self.text_encoder: Optional[Mistral3ForConditionalGeneration] = None
+        self.tokenizer: Optional[AutoProcessor] = None
+
+    async def load(self):
+        """Load the text encoder and tokenizer into memory."""
+        logger.info("🔄 Loading models...")
+
+        t0 = time.time()
+        self.text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
+            self.text_encoder_id,
+            dtype=self.dtype,
+            device_map=self.device_map,
+        ).eval()
+        logger.info(
+            "✅ Loaded Mistral text encoder (%.2fs) dtype=%s device=%s",
+            time.time() - t0,
+            self.text_encoder.dtype,
+            self.device_map,
+        )
+
+        t1 = time.time()
+        self.tokenizer = AutoProcessor.from_pretrained(self.tokenizer_id)
+        logger.info("✅ Loaded tokenizer in %.2fs", time.time() - t1)
+
+        torch.set_grad_enabled(False)
+
+    async def unload(self):
+        """Cleanup method to properly unload models."""
+        logger.info("🧹 Cleaning up model resources...")
+        try:
+            if self.text_encoder is not None:
+                del self.text_encoder
+                self.text_encoder = None
+
+            if self.tokenizer is not None:
+                del self.tokenizer
+                self.tokenizer = None
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            logger.info("✅ Model components unloaded successfully")
+        except Exception as e:
+            logger.error(f"Error unloading model components: {str(e)}")
+
+    def get_models(self):
+        """Return loaded models or raise if not available."""
+        if self.text_encoder is None or self.tokenizer is None:
+            raise RuntimeError("Model not loaded")
+        return self.text_encoder, self.tokenizer
+
+
+model_manager = ModelManager()
+
+
+# ------------------------------------------------------
 # Lifespan (startup + shutdown)
 # ------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global text_encoder, tokenizer
-
-    logger.info("🔄 Loading models...")
-
-    t0 = time.time()
-    text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
-        TEXT_ENCODER_ID,
-        dtype=DTYPE,
-        device_map=DEVICE_MAP,
-    ).eval()
-    logger.info(
-        "✅ Loaded Mistral text encoder (%.2fs) dtype=%s device=%s",
-        time.time() - t0,
-        text_encoder.dtype,
-        DEVICE_MAP,
-    )
-
-    t1 = time.time()
-    tokenizer = AutoProcessor.from_pretrained(TOKENIZER_ID)
-    logger.info("✅ Loaded tokenizer in %.2fs", time.time() - t1)
-
-    torch.set_grad_enabled(False)
-
-    yield
-
-    logger.info("🧹 Cleaning up model resources...")
-    del text_encoder
-    del tokenizer
+    await model_manager.load()
+    try:
+        yield
+    finally:
+        await model_manager.unload()
 
 
 # ------------------------------------------------------
@@ -91,16 +135,6 @@ class PredictRequest(BaseModel):
     prompt: Union[str, List[str]]
 
 
-class PredictResponse(BaseModel):
-    # (B_out, L, D)
-    prompt_embeds: List[List[List[float]]]
-    # (B_out, L, 4)
-    text_ids: List[List[List[int]]]
-    # for introspection/debug
-    shapes: Dict[str, List[int]]
-    time_ms: float
-
-
 # ------------------------------------------------------
 # Routes
 # ------------------------------------------------------
@@ -109,12 +143,24 @@ def root():
     return {"message": "Mistral Text Encoder API is running."}
 
 
-@app.post("/predict", response_model=PredictResponse)
-def predict(req: PredictRequest):
-    global text_encoder, tokenizer
+@app.get("/health")
+def health():
+    """Simple health endpoint."""
+    return {
+        "status": "healthy",
+        "model_loaded": model_manager.text_encoder is not None
+        and model_manager.tokenizer is not None,
+        "device_map": model_manager.device_map,
+        "dtype": str(model_manager.dtype),
+    }
 
-    if text_encoder is None or tokenizer is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
+
+@app.post("/predict")
+def predict(req: PredictRequest):
+    try:
+        text_encoder, tokenizer = model_manager.get_models()
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
     t0 = time.time()
 
@@ -141,21 +187,17 @@ def predict(req: PredictRequest):
         tuple(text_ids.shape),
     )
 
-    # Keep original shapes; just make them JSON-serializable
-    pe_cpu = prompt_embeds.detach().cpu().to(torch.float32)
-    ti_cpu = text_ids.detach().cpu().to(torch.int32)
+    # Save tensor to bytes
+    buffer = io.BytesIO()
+    torch.save(prompt_embeds.cpu(), buffer)
+    buffer.seek(0)
 
-    prompt_embeds_out = pe_cpu.tolist()  # List[B_out][L][D]
-    text_ids_out = ti_cpu.tolist()  # List[B_out][L][4]
+    # Clear GPU cache
+    del prompt_embeds, text_ids
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    shapes = {
-        "prompt_embeds": list(pe_cpu.shape),  # [B_out, L, D]
-        "text_ids": list(ti_cpu.shape),  # [B_out, L, 4]
-    }
-
-    return PredictResponse(
-        prompt_embeds=prompt_embeds_out,
-        text_ids=text_ids_out,
-        shapes=shapes,
-        time_ms=duration,
+    return StreamingResponse(
+        buffer,
+        media_type="application/octet-stream",
     )

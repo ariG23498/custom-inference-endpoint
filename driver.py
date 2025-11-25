@@ -86,13 +86,12 @@ if __name__ == "__main__":
     tokenizer = AutoProcessor.from_pretrained(tok_id)
 
     prompt = ["hello aritra", "how are you?"]
-    local_prompt_embeds, local_text_ids = encode_prompt(
+    local_prompt_embeds, _ = encode_prompt(
         text_encoder=text_encoder,
         tokenizer=tokenizer,
         prompt=prompt,
     )
     local_prompt_embeds = local_prompt_embeds.detach().cpu()
-    local_text_ids = local_text_ids.detach().cpu()
 
     url = f"{os.environ['ENDPOINT']}/predict"
     headers = {
