@@ -5,7 +5,9 @@ from transformers import Mistral3ForConditionalGeneration, AutoProcessor
 import torch
 from text_encoding import encode_prompt
 import requests
+from dotenv import load_dotenv
 
+load_dotenv()
 
 def post_with_retries(
     url: str,
