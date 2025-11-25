@@ -58,7 +58,7 @@ The FastAPI server:
 
 To start the API locally:
 
-> ![NOTE]
+> [!NOTE]
 > When you want to run the FastAPI service locally make sure to make the following change in the `text_encoding_fastapi_service.py`
 
 ```diff
