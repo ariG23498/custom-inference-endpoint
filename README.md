@@ -90,7 +90,7 @@ The Dockerfile bundles:
 Build the image:
 
 ```bash
-docker build -t mistral-endpoint .
+docker build -t mistral-endpoint . --platform linux/amd64
 ```
 
 Run locally with GPU:
